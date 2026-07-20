@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.DS_Store
+
+# 数据与输出缓存(体积大,不入库)
+data/cache/
+outputs/
+*.parquet
+*.duckdb
+*.duckdb.wal
+
+# 本地敏感配置
+.env

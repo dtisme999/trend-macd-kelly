@@ -1,0 +1,25 @@
+# --- 核心 ---
+pandas>=2.0
+numpy>=1.24
+pyyaml>=6.0
+pydantic>=2.5
+
+# --- 数据源 ---
+akshare>=1.12
+# tushare>=1.4            # 可选: 若使用 tushare 数据源再安装并设置 TUSHARE_TOKEN
+
+# --- 存储与计算 ---
+duckdb>=0.10
+pyarrow>=14.0
+
+# --- 统计验证 ---
+scipy>=1.11
+scikit-learn>=1.3
+arch>=6.3                 # SPA / stationary bootstrap; 缺失时会优雅降级
+
+# --- 界面与可视化 ---
+plotly>=5.18
+streamlit>=1.30
+
+# --- 可选(默认不装,规避 numba/Python3.13 兼容风险) ---
+# vectorbt>=0.26          # 参数网格加速;当前 backtest/vector_research.py 用纯 pandas 实现,无需安装
