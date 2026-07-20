@@ -1,0 +1,90 @@
+# 趋势-MACD收敛-动态凯利仓位 · 个人研究版默认配置(中性档)
+# 字段含义见报告 "配置示例与接口原型" 章节。
+
+seed: 42
+
+project:
+  name: trend_macd_kelly_personal
+  market: cn_stock_daily
+  benchmark: "000300"            # 沪深300
+  start_date: "2016-01-01"       # 与 Tushare 历史 ST 起始对齐
+  end_date: "2026-07-17"
+
+data:
+  provider: "akshare"            # akshare | tushare
+  adjust: "hfq"                  # hfq | qfq | raw (统一复权口径,研究用 hfq)
+  use_st_filter: false           # AKShare 无历史 ST,默认关;若用 tushare 可开
+  min_listing_days: 120
+  min_avg_amount_20d: 50000000   # 20 日均成交额下限(元)
+  symbols_source: "hs300"        # hs300 | custom
+  custom_symbols: []
+  universe_size: 50              # 0 表示全部成分股
+
+features:
+  ma_fast: 20
+  ma_mid: 60
+  ma_slow: 120
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  atr_period: 14
+  vol_period: 20
+  trend_score_min: 4
+
+signal:
+  wait_bars_after_death_cross: 2
+  convergence_bars: 2
+  require_hist_below_zero: true
+  require_dif_turn_up: false
+  cooldown_days: 5
+
+execution:
+  init_cash: 1000000
+  price_rule: "next_open"        # 仅支持 T 日收盘信号 -> T+1 日开盘成交
+  lot_size: 100
+  slippage_bp: 5                 # 基点,1bp=0.01%
+  buy_commission_bp: 2.5
+  sell_commission_bp: 2.5
+  min_commission: 5              # 元
+  stamp_tax_sell_bp: 10          # 卖方印花税
+
+position:
+  mode: "fractional_kelly"       # fixed | fractional_kelly
+  fixed_weight: 0.05
+  kelly_fraction: 0.25           # 1/4 Kelly
+  kelly_min_samples: 20          # <20 退回固定仓位
+  kelly_weight_min: 0.02
+  kelly_weight_max: 0.10
+  fallback_fixed_weight: 0.05
+  init_ratio: 0.40               # 初始建仓 = 权重 * init_ratio
+  add1_target_ratio: 0.70
+  add2_target_ratio: 1.00
+  add1_mode: "breakout"          # breakout(突破调整高点) | profit(浮盈%)
+  add1_profit_pct: 0.03
+  add2_profit_atr: 1.0           # 浮盈 N 倍 ATR 触发第二次加仓
+  vol_target: 0.02               # vol_adj 的 sigma*
+  max_single_weight: 0.10
+  max_total_exposure: 0.80
+
+risk:
+  init_stop_atr: 2.0             # 初始止损 = 建仓价 - N*ATR
+  drawdown_reduce_1: 0.05        # 自持仓高点回撤 5% 减仓
+  drawdown_reduce_2: 0.08        # 8% 再减
+  drawdown_exit: 0.12            # 12% 清仓
+  reduce_fraction_1: 0.33
+  reduce_fraction_2: 0.50
+  max_holding_days: 120
+  ineffective_holding_days: 60
+  min_effective_return: 0.03
+
+validation:
+  walk_forward: true
+  train_years: 3
+  test_years: 1
+  step_years: 1
+  bootstrap_reps: 1000
+  bootstrap_block_len: 20
+  bootstrap_type: "stationary"
+  run_spa_test: true
+  run_dsr: true
+  n_trials_for_dsr: 27           # DSR 用的试验数估计(三档参数组合)

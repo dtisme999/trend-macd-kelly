@@ -1,0 +1,61 @@
+# 三档可解释默认档位(保守/中性/激进),中性档等同 default.yaml。
+# 字段对齐报告 "默认参数表"。profile 通过 config_loader.load_config(profile=...) 合并到 default 之上。
+
+profiles:
+  conservative:
+    features:
+      trend_score_min: 5
+      ma_fast: 20
+      ma_mid: 60
+      ma_slow: 120
+      macd_fast: 12
+      macd_slow: 26
+      macd_signal: 9
+    signal:
+      wait_bars_after_death_cross: 3
+      convergence_bars: 2
+    position:
+      init_ratio: 0.30
+      add1_target_ratio: 0.60
+      add2_target_ratio: 1.00
+      add2_profit_atr: 1.2
+      max_single_weight: 0.08
+      max_total_exposure: 0.60
+      fixed_weight: 0.04
+      kelly_fraction: 0.25
+    risk:
+      init_stop_atr: 2.5
+      drawdown_reduce_1: 0.06
+      drawdown_reduce_2: 0.10
+      drawdown_exit: 0.14
+
+  neutral: {}  # 与 default.yaml 完全一致
+
+  aggressive:
+    features:
+      ma_fast: 10
+      ma_mid: 40
+      ma_slow: 100
+      macd_fast: 8
+      macd_slow: 21
+      macd_signal: 6
+      trend_score_min: 4
+    signal:
+      wait_bars_after_death_cross: 1
+      convergence_bars: 1
+    position:
+      init_ratio: 0.50
+      add1_target_ratio: 0.80
+      add2_target_ratio: 1.00
+      add1_mode: "profit"        # 激进档用浮盈 3% 触发首次加仓
+      add1_profit_pct: 0.03
+      add2_profit_atr: 0.8
+      max_single_weight: 0.12
+      max_total_exposure: 0.90
+      fixed_weight: 0.06
+      kelly_fraction: 0.333      # 约 1/3 Kelly
+    risk:
+      init_stop_atr: 1.5
+      drawdown_reduce_1: 0.04
+      drawdown_reduce_2: 0.06
+      drawdown_exit: 0.10
