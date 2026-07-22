@@ -1,13 +1,12 @@
 """验证层:对照组 B0-B4 / 滚动扩窗 / 配对 t 检验 / DSR / SPA / stationary bootstrap。
 
 对照组(测各层是否真有增量):
-  B0 基准持有 | B1 趋势筛选等权 | B2 +MACD收敛(固定仓位,无加减仓) | B3 +加减仓 | B4 +动态凯利
+  B0 基准持有 | B1 趋势筛选等权 | B2 预判买点入场(无加减仓) | B3 + 加减仓 | B4 + 全状态机
+
 统计检验三层:
   1. 配对 t 检验(月度超额收益差,scipy ttest_rel)
   2. SPA(arch,缺失则跳过)
   3. DSR(Bailey-López de Prado,纠正多试验选择偏差)
-样本外:滚动扩窗 训练N年/验证1年/步长1年,训练窗估计凯利统计量,验证窗冻结执行。
-bootstrap:stationary bootstrap 给年化/回撤/夏普置信区间(arch 缺失时用纯 numpy 实现)。
 """
 from __future__ import annotations
 
@@ -40,16 +39,17 @@ def run_control_groups(feature_df, bench_df, cfg, seed=42):
     }
     groups["B1"] = run_equal_weight_trend(feature_df, cfg, bench_df=bench_df, seed=seed)
 
-    cfg_fixed = copy.deepcopy(cfg)
-    cfg_fixed.position.mode = "fixed"
-    groups["B2"] = run_executor(feature_df, cfg_fixed, use_macd=True, use_exits=True,
-                                use_adds=False, use_reduces=False, position_mode="fixed",
+    # B2:只有入场信号,不加仓不减仓不止损(纯看入场质量)
+    groups["B2"] = run_executor(feature_df, cfg, use_macd=True, use_exits=False,
+                                use_adds=False, use_reduces=False,
                                 bench_df=bench_df, seed=seed)
-    groups["B3"] = run_executor(feature_df, cfg_fixed, use_macd=True, use_exits=True,
-                                use_adds=True, use_reduces=True, position_mode="fixed",
+    # B3:入场 + 加仓(不含退出)
+    groups["B3"] = run_executor(feature_df, cfg, use_macd=True, use_exits=False,
+                                use_adds=True, use_reduces=False,
                                 bench_df=bench_df, seed=seed)
+    # B4:完整策略(入场 + 加仓 + 减仓 + 止损 + 超时 + 保本)
     groups["B4"] = run_executor(feature_df, cfg, use_macd=True, use_exits=True,
-                                use_adds=True, use_reduces=True, position_mode="fractional_kelly",
+                                use_adds=True, use_reduces=True,
                                 bench_df=bench_df, seed=seed)
 
     metrics = {k: compute_metrics(r["equity_df"], r.get("trades_df"), r.get("fills_df"), init_cash)
@@ -60,21 +60,6 @@ def run_control_groups(feature_df, bench_df, cfg, seed=42):
 # --------------------------------------------------------------------------- #
 # 滚动扩窗
 # --------------------------------------------------------------------------- #
-def _chain_equity(equity_dfs, init_cash):
-    out, scale = [], init_cash
-    for eq in equity_dfs:
-        eq = eq.sort_values("trade_date").reset_index(drop=True)
-        first = eq["equity"].iloc[0]
-        if first <= 0:
-            first = 1.0
-        ratio = scale / first
-        eq = eq[["trade_date", "equity", "cash", "market_value", "n_positions", "exposure"]].copy()
-        eq["equity"] = eq["equity"] * ratio
-        out.append(eq)
-        scale = float(eq["equity"].iloc[-1])
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
-
-
 def walk_forward(feature_df, bench_df, cfg, seed=42):
     vc = cfg.validation
     dates = sorted(feature_df["trade_date"].unique())
@@ -100,24 +85,19 @@ def walk_forward(feature_df, bench_df, cfg, seed=42):
         test_df = feature_df[(feature_df.trade_date >= train_end) & (feature_df.trade_date < test_end)]
         if train_df.empty or test_df.empty:
             continue
-        # 训练窗:在线凯利跑出已闭合交易,估计 p̂/b̂
+        # 训练窗跑一遍确认信号逻辑;验证窗直接跑完整策略(不再需要 kelly 估计)
         train_res = run_executor(train_df, cfg, use_macd=True, use_exits=True, use_adds=True,
-                                 use_reduces=True, position_mode="fractional_kelly", seed=seed)
-        train_closed = pd.Series([t["return"] for t in train_res["closed_trades"]]) \
-            if train_res["closed_trades"] else pd.Series(dtype=float)
-        # 验证窗:冻结凯利统计量
-        frozen = train_closed if len(train_closed) >= cfg.position.kelly_min_samples else None
+                                 use_reduces=True, seed=seed)
         test_res = run_executor(test_df, cfg, use_macd=True, use_exits=True, use_adds=True,
-                                use_reduces=True, position_mode="fractional_kelly",
-                                frozen_kelly_returns=frozen, seed=seed)
+                                use_reduces=True, seed=seed)
         if test_res["equity_df"].empty:
             continue
         test_equities.append(test_res["equity_df"])
         stats.append({
             "train_start": str(t0.date()), "train_end": str(train_end.date()),
             "test_start": str(train_end.date()), "test_end": str(test_end.date()),
-            "n_train_closed": int(len(train_closed)),
-            "n_test_trades": int(len(test_res["trades_df"])),
+            "train_closed": int(len(train_res.get("closed_trades", []))),
+            "test_trades": int(len(test_res.get("trades_df", []))),
         })
 
     if not test_equities:
@@ -126,6 +106,21 @@ def walk_forward(feature_df, bench_df, cfg, seed=42):
     if bench_df is not None and not combined.empty:
         combined = _merge_benchmark(combined, bench_df, cfg.execution.init_cash)
     return {"equity_df": combined, "windows": stats, "n_windows": len(test_equities)}
+
+
+def _chain_equity(equity_dfs, init_cash):
+    out, scale = [], init_cash
+    for eq in equity_dfs:
+        eq = eq.sort_values("trade_date").reset_index(drop=True)
+        first = eq["equity"].iloc[0]
+        if first <= 0:
+            first = 1.0
+        ratio = scale / first
+        eq = eq[["trade_date", "equity", "cash", "market_value", "n_positions", "exposure"]].copy()
+        eq["equity"] = eq["equity"] * ratio
+        out.append(eq)
+        scale = float(eq["equity"].iloc[-1])
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
 
 # --------------------------------------------------------------------------- #
@@ -138,7 +133,7 @@ def paired_ttest(strat_monthly: pd.Series, bench_monthly: pd.Series) -> dict:
     diff = df["s"] - df["b"]
     if diff.std() == 0:
         return {"t": 0.0, "p": 1.0, "n": int(len(df)), "mean_diff": float(diff.mean()),
-                "note": "无差异(两序列月度收益完全一致,如 B4 凯利退回固定仓位时)"}
+                "note": "无差异(两序列月度收益完全一致)"}
     t, p = ttest_rel(df["s"], df["b"])
     return {"t": float(t), "p": float(p), "n": int(len(df)),
             "mean_diff": float(diff.mean())}
@@ -149,8 +144,6 @@ def deflated_sharpe_ratio(sharpe: float, n_trials: int, n_obs: int,
     """Bailey & López de Prado DSR。
 
     sharpe 为非年化(日)夏普 mean/std;n_obs 为观测数。
-    零分布下 SR~N(0,1/n_obs),故期望最大 SR = E[max N(0,1)] / sqrt(n_obs)。
-    n_trials=1 时退化为标准单边 t 检验 p 值。
     """
     if n_obs < 2:
         return 0.0
@@ -177,7 +170,7 @@ def spa_test(strategy_monthly: pd.Series, bench_monthly: pd.Series, reps: int = 
         df = pd.concat([strategy_monthly.rename("s"), bench_monthly.rename("b")], axis=1).dropna()
         if len(df) < 30:
             return {"p": None, "note": "样本不足,SPA 跳过"}
-        np.random.seed(42)  # arch 8.0 SPA 不接受 random_state,统一设种子
+        np.random.seed(42)  # arch 不接受 random_state,统一设种子
         spa = SPA(df["b"].values, df["s"].values.reshape(-1, 1),
                   bootstrap="stationary", reps=reps)
         spa.compute()
@@ -238,18 +231,12 @@ def run_validation(feature_df, bench_df, cfg, seed=42):
 
     b4_eq = groups["B4"]["equity_df"]
     b0_eq = groups["B0"]["equity_df"]
-    b2_eq = groups["B2"]["equity_df"]
-    b3_eq = groups["B3"]["equity_df"]
 
     b4_m = monthly_returns(b4_eq)
     b0_m = monthly_returns(b0_eq)
-    b2_m = monthly_returns(b2_eq)
-    b3_m = monthly_returns(b3_eq)
 
     t_tests = {
-        "B4_vs_bench": paired_ttest(b4_m, b0_m),
-        "B3_vs_B2": paired_ttest(b3_m, b2_m),
-        "B4_vs_B3": paired_ttest(b4_m, b3_m),
+        "B4_vs_B0": paired_ttest(b4_m, b0_m),
     }
 
     dsr = None

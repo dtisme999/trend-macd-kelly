@@ -27,7 +27,7 @@ def compute_daily_features(bars: pd.DataFrame, bench_df: pd.DataFrame, cfg) -> p
 SIGNAL_COLUMNS = [
     "trade_date", "symbol", "open", "high", "low", "close", "volume", "amount",
     "ma_fast", "ma_mid", "ma_slow", "dif", "dea", "hist", "atr", "vol20",
-    "trend_score", "trend_ok", "death_cross", "conv_n", "bars_since_dc", "entry_candidate",
+    "trend_score", "trend_ok", "prior_pos_run", "neg_run_k", "entry_candidate",
 ]
 
 

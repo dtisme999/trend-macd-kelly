@@ -1,13 +1,13 @@
 """轻量事件执行层:按交易日循环,T 日收盘信号 -> T+1 日开盘成交。
 
-天然支持:T+1 开盘成交、手续费、滑点、现金约束、100 股取整、单股/总仓位上限、
-分批加仓(突破调整高点/浮盈 ATR)、回撤分档减仓、初始止损(ATR)、最大持仓、
-无效持仓退出。FIFO 分批跟踪用于首仓/加仓贡献归因。
+支持能力:
+- T+1 开盘成交、手续费、滑点、现金约束、100 股取整
+- A 锚点状态机(S1/S2/S3/S4)驱动的加仓、减仓、止损、超时、保本、回落全清
+- FIFO 分批跟踪(首仓 = "init",一档加仓 = "add1")
 
-防偏差三条硬性规则(对应 tests/test_anti_bias.py):
-1. 指标/信号在 symbol 内 shift 界定(在 vector_research 完成)
+防偏差:
+1. 指标/信号在 symbol 内 shift 界定(vector_research 完成)
 2. 所有订单由 "T 日信号 -> T+1 日开盘价" 产生(本文件 pending 机制)
-3. 凯利 p̂/b̂ 仅来自此前已闭合交易(closed_trades 在卖出成交后才追加)
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from strategy import kelly as kelly_mod
 from strategy import rules as rules_mod
 
 
@@ -25,7 +24,7 @@ from strategy import rules as rules_mod
 # --------------------------------------------------------------------------- #
 @dataclass
 class Lot:
-    lot_type: str          # init | add1 | add2
+    lot_type: str          # init | add1
     qty: int
     price: float
     date: pd.Timestamp
@@ -35,33 +34,30 @@ class Lot:
 class Order:
     symbol: str
     side: str              # buy | sell
-    order_type: str        # init | add1 | add2 | reduce | exit
+    order_type: str        # init | add1 | reduce | exit
     target_value: float = 0.0
     reduce_fraction: float = 0.0
     reason: str = ""
-    weight: float = 0.0    # 仅 init 用:记录建仓时权重(加仓复用)
 
 
 @dataclass
 class Position:
     symbol: str
     lots: list = field(default_factory=list)
-    highest_close: float = 0.0
-    highest_high_since_entry: float = 0.0
+    A: float = 0.0                        # 首笔成交价(锚点)
+    state: int = 1                        # 1..4
     entry_date: pd.Timestamp = None
-    atr_at_entry: float = 0.0
-    add1_done: bool = False
-    add2_done: bool = False
-    reduce1_done: bool = False
-    reduce2_done: bool = False
-    entry_trend_score: int = 0
-    entry_vol20: float = 0.0
+    entry_seq_idx: int = 0                # 建仓日在该 symbol 时间轴上的序号
+    add_seq_idx: int = -1                 # 加仓日的序号
+    reached_110: bool = False
+    reached_120: bool = False
+    reached_130: bool = False
+    reached_140: bool = False
+    highest_close: float = 0.0
     last_close: float = 0.0
-    weight: float = 0.0
     cost_total: float = 0.0
-    cost_by_type: dict = field(default_factory=lambda: {"init": 0.0, "add1": 0.0, "add2": 0.0})
-    realized_by_type: dict = field(default_factory=lambda: {"init": 0.0, "add1": 0.0, "add2": 0.0})
     realized_pnl_total: float = 0.0
+    realized_by_type: dict = field(default_factory=lambda: {"init": 0.0, "add1": 0.0})
     reduce_fills: list = field(default_factory=list)
     exit_price: float = 0.0
 
@@ -71,7 +67,6 @@ class Position:
 
     @property
     def cost(self) -> float:
-        """剩余分批的加权均价(用于止损/浮盈判断)。"""
         q = self.qty
         if q <= 0:
             return 0.0
@@ -85,7 +80,7 @@ def _is_tradable(row) -> bool:
     vol = row.get("volume", 0)
     if pd.isna(vol) or vol <= 0:
         return False
-    if row["high"] == row["low"]:        # 一字板近似:无法成交
+    if row["high"] == row["low"]:   # 一字板近似
         return False
     return True
 
@@ -104,16 +99,13 @@ def _merge_benchmark(equity_df: pd.DataFrame, bench_df: pd.DataFrame, init_cash:
 # --------------------------------------------------------------------------- #
 class Executor:
     def __init__(self, feature_df, cfg, use_macd=True, use_exits=True,
-                 use_adds=True, use_reduces=True,
-                 position_mode=None, frozen_kelly_returns=None, seed=42):
+                 use_adds=True, use_reduces=True, seed=42):
         self.feature_df = feature_df
         self.cfg = cfg
         self.use_macd = use_macd
         self.use_exits = use_exits
         self.use_adds = use_adds
         self.use_reduces = use_reduces
-        self.position_mode = position_mode or cfg.position.mode
-        self.frozen_kelly_returns = frozen_kelly_returns
         self.cash = cfg.execution.init_cash
         self.positions: dict[str, Position] = {}
         self.closed_trades: list[dict] = []
@@ -124,6 +116,11 @@ class Executor:
         self._date_groups = {dt: g.set_index("symbol")
                              for dt, g in feature_df.groupby("trade_date")}
         self.trading_dates = sorted(self._date_groups.keys())
+        # 每只 symbol 在其自身时间轴上的 0-based 序号(用于 timeout 计数)
+        self._sym_date_idx: dict[str, dict[pd.Timestamp, int]] = {}
+        for sym, g in feature_df.groupby("symbol", sort=False):
+            dates = sorted(g["trade_date"].unique())
+            self._sym_date_idx[sym] = {d: i for i, d in enumerate(dates)}
 
     # ---- 主循环 ----
     def run(self):
@@ -137,14 +134,14 @@ class Executor:
         for od in self.pending:
             self._execute_order(od, today, dt)
         self.pending = []
-        # 2. 盯盘(更新 highest_close,含今日)
+        # 2. 盯盘 + 状态更新
         self._mark_to_market(today)
         equity = self._equity()
-        # 3. 持仓管理:退出/减仓/加仓(信号今日收盘 -> 明日开盘)
+        # 3. 持仓管理:状态机
         for sym in list(self.positions.keys()):
             if sym in today.index:
                 self._manage_position(sym, today, dt, equity)
-        # 4. 新建仓(趋势+MACD收敛信号)
+        # 4. 新建仓
         if self.use_macd:
             self._generate_entries(today, dt, equity)
         # 5. 记录净值
@@ -153,10 +150,21 @@ class Executor:
     # ---- 盯盘 ----
     def _mark_to_market(self, today):
         for sym, pos in self.positions.items():
-            if sym in today.index:
-                close = float(today.loc[sym, "close"])
-                pos.last_close = close
-                pos.highest_close = max(pos.highest_close, close)
+            if sym not in today.index:
+                continue
+            close = float(today.loc[sym, "close"])
+            pos.last_close = close
+            pos.highest_close = max(pos.highest_close, close)
+            if pos.A > 0:
+                r = self.cfg.risk
+                if close >= pos.A * (1 + r.add_trigger_pct):
+                    pos.reached_110 = True
+                if close >= pos.A * (1 + r.tp1_pct):
+                    pos.reached_120 = True
+                if close >= pos.A * (1 + r.tp2_pct):
+                    pos.reached_130 = True
+                if close >= pos.A * (1 + r.tp3_pct):
+                    pos.reached_140 = True
 
     def _equity(self) -> float:
         mv = sum(p.qty * p.last_close for p in self.positions.values())
@@ -198,8 +206,6 @@ class Executor:
         qty = cap_qty(od.target_value / fill_px)
         if qty <= 0:
             return
-
-        # 现金约束
         cost = qty * fill_px
         fee = max(cost * ec.buy_commission_bp / 1e4, ec.min_commission)
         if cost + fee > self.cash:
@@ -226,25 +232,24 @@ class Executor:
             cost, fee = qty * fill_px, max(cost * ec.buy_commission_bp / 1e4, ec.min_commission)
 
         self.cash -= (cost + fee)
+        seq_idx = self._sym_date_idx.get(od.symbol, {}).get(dt, 0)
+
         if pos is None:
             pos = Position(
-                symbol=od.symbol, entry_date=dt,
-                atr_at_entry=float(today.loc[od.symbol, "atr"]),
-                entry_trend_score=int(today.loc[od.symbol, "trend_score"]),
-                entry_vol20=float(today.loc[od.symbol, "vol20"]),
+                symbol=od.symbol,
+                A=fill_px,
+                entry_date=dt,
+                entry_seq_idx=seq_idx,
                 highest_close=float(today.loc[od.symbol, "close"]),
-                highest_high_since_entry=float(today.loc[od.symbol, "high"]),
                 last_close=float(today.loc[od.symbol, "close"]),
-                weight=od.weight,
             )
             self.positions[od.symbol] = pos
         pos.lots.append(Lot(od.order_type, qty, fill_px, dt))
         pos.cost_total += cost
-        pos.cost_by_type[od.order_type] += cost
         if od.order_type == "add1":
-            pos.add1_done = True
-        elif od.order_type == "add2":
-            pos.add2_done = True
+            pos.state = 2
+            pos.add_seq_idx = seq_idx
+
         self.fills.append({
             "trade_date": dt, "symbol": od.symbol, "action": "BUY",
             "order_type": od.order_type, "lot_type": od.order_type,
@@ -268,7 +273,6 @@ class Executor:
         stamp = proceeds * ec.stamp_tax_sell_bp / 1e4
         net = proceeds - fee - stamp
 
-        # FIFO 减仓
         remaining = qty
         realized = 0.0
         while remaining > 0 and pos.lots:
@@ -286,6 +290,12 @@ class Executor:
 
         if od.order_type == "reduce":
             pos.reduce_fills.append((fill_px, qty))
+            # 状态转移:S2 -> S3(第一次减仓,tp1),S3 -> S4(第二次减仓,tp2)
+            if pos.state == 2:
+                pos.state = 3
+            elif pos.state == 3:
+                pos.state = 4
+
         self.fills.append({
             "trade_date": dt, "symbol": od.symbol, "action": "SELL",
             "order_type": od.order_type, "lot_type": "",
@@ -297,7 +307,7 @@ class Executor:
 
     def _close_trade(self, pos: Position, exit_date):
         init_pnl = pos.realized_by_type.get("init", 0.0)
-        add_pnl = pos.realized_by_type.get("add1", 0.0) + pos.realized_by_type.get("add2", 0.0)
+        add_pnl = pos.realized_by_type.get("add1", 0.0)
         reduce_prot = sum(max(0.0, p - pos.exit_price) * q for p, q in pos.reduce_fills)
         invested = pos.cost_total
         ret = pos.realized_pnl_total / invested if invested > 0 else 0.0
@@ -305,95 +315,59 @@ class Executor:
             "symbol": pos.symbol, "entry_date": pos.entry_date, "exit_date": exit_date,
             "holding_days": (exit_date - pos.entry_date).days,
             "invested_cost": invested, "realized_pnl": pos.realized_pnl_total, "return": ret,
-            "entry_trend_score": pos.entry_trend_score, "entry_vol20": pos.entry_vol20,
+            "A": pos.A,
             "init_pnl": init_pnl, "add_pnl": add_pnl, "reduce_protection": reduce_prot,
-            "n_adds": (1 if pos.add1_done else 0) + (1 if pos.add2_done else 0),
-            "weight": pos.weight,
+            "reached_120": pos.reached_120, "reached_130": pos.reached_130,
+            "reached_140": pos.reached_140,
         })
         self.last_exit_date[pos.symbol] = exit_date
         del self.positions[pos.symbol]
 
-    # ---- 持仓管理(退出/减仓/加仓) ----
+    # ---- 持仓管理:状态机 ----
     def _manage_position(self, sym, today, dt, equity):
         pos = self.positions[sym]
         close = float(today.loc[sym, "close"])
-        high = float(today.loc[sym, "high"])
         pos.last_close = close
+        seq_idx = self._sym_date_idx.get(sym, {}).get(dt, 0)
 
-        # 1. 清仓级退出(止损/回撤清仓/超时/无效)
-        if self.use_exits:
-            action = rules_mod.check_full_exit(pos, close, dt, self.cfg.risk)
-            if action:
-                reason, frac = action
-                self.pending.append(Order(sym, "sell", "exit",
-                                          reduce_fraction=frac, reason=reason))
-                pos.highest_high_since_entry = max(pos.highest_high_since_entry, high)
-                return
+        action = rules_mod.check_state_action(pos, close, seq_idx, self.cfg.risk)
+        if action is None:
+            return
+        reason, kind, frac = action
 
-        # 2. 回撤分档减仓(部分)
-        if self.use_reduces:
-            action = rules_mod.check_reduce(pos, close, self.cfg.risk)
-            if action:
-                reason, frac = action
-                if frac >= self.cfg.risk.reduce_fraction_2:
-                    pos.reduce2_done = True
-                else:
-                    pos.reduce1_done = True
-                self.pending.append(Order(sym, "sell", "reduce",
-                                          reduce_fraction=frac, reason=reason))
-                pos.highest_high_since_entry = max(pos.highest_high_since_entry, high)
-                return  # 减仓当日不加仓
-
-        # 3. 加仓(突破调整高点 / 浮盈 ATR)
-        if self.use_adds:
-            add1_reason = rules_mod.check_add1(pos, close, self.cfg.position)
-            if add1_reason:
-                target = equity * pos.weight * self.cfg.position.add1_target_ratio - pos.qty * close
-                if target > 0:
-                    self.pending.append(Order(sym, "buy", "add1",
-                                              target_value=target, reason=add1_reason, weight=pos.weight))
-            else:
-                add2_reason = rules_mod.check_add2(pos, close, self.cfg.position)
-                if add2_reason:
-                    target = equity * pos.weight * self.cfg.position.add2_target_ratio - pos.qty * close
-                    if target > 0:
-                        self.pending.append(Order(sym, "buy", "add2",
-                                                  target_value=target, reason=add2_reason, weight=pos.weight))
-        pos.highest_high_since_entry = max(pos.highest_high_since_entry, high)
+        if kind == "exit_full" and self.use_exits:
+            self.pending.append(Order(sym, "sell", "exit",
+                                      reduce_fraction=1.0, reason=reason))
+            return
+        if kind == "reduce_step" and self.use_reduces:
+            self.pending.append(Order(sym, "sell", "reduce",
+                                      reduce_fraction=frac, reason=reason))
+            return
+        if kind == "add_step" and self.use_adds:
+            # 目标:再加 fixed_weight(即 5%)相当权重的金额
+            add_target = equity * self.cfg.position.fixed_weight
+            self.pending.append(Order(sym, "buy", "add1",
+                                      target_value=add_target, reason=reason))
+            return
 
     # ---- 新建仓 ----
     def _generate_entries(self, today, dt, equity):
         if "entry_candidate" not in today.columns:
             return
         cand = today.index[today["entry_candidate"].fillna(False)]
+        weight = self.cfg.position.fixed_weight
         for sym in cand:
             if sym in self.positions:
                 continue
             if sym in self.last_exit_date and \
                     (dt - self.last_exit_date[sym]).days < self.cfg.signal.cooldown_days:
                 continue
-            row = today.loc[sym]
-            vol20 = float(row["vol20"])
-            weight = self._position_weight(vol20)
-            if weight <= 0:
-                continue
-            target_value = equity * weight * self.cfg.position.init_ratio
+            target_value = equity * weight
             if target_value <= 0:
                 continue
-            reason = f"{rules_mod.REASON_TREND_OK};{rules_mod.REASON_MACD_CONVERGING}"
             self.pending.append(Order(sym, "buy", "init",
-                                      target_value=target_value, reason=reason, weight=weight))
-
-    def _position_weight(self, vol20: float) -> float:
-        pc = self.cfg.position
-        if self.position_mode == "fixed":
-            return pc.fixed_weight
-        # fractional_kelly
-        if self.frozen_kelly_returns is not None:
-            closed_ret = self.frozen_kelly_returns
-        else:
-            closed_ret = pd.Series([t["return"] for t in self.closed_trades])
-        return kelly_mod.kelly_weight(closed_ret, vol20, pc)
+                                      target_value=target_value,
+                                      reason=rules_mod.REASON_ENTRY_PULLBACK_PREDICT))
 
     # ---- 结果 ----
     def _results(self):
@@ -404,10 +378,9 @@ class Executor:
         trades_df = pd.DataFrame(self.closed_trades)
         if self.positions:
             positions_df = pd.DataFrame([{
-                "symbol": p.symbol, "qty": p.qty, "cost": p.cost,
-                "last_close": p.last_close, "market_value": p.qty * p.last_close,
-                "weight": p.weight, "entry_date": p.entry_date,
-                "add1_done": p.add1_done, "add2_done": p.add2_done,
+                "symbol": p.symbol, "qty": p.qty, "cost": p.cost, "A": p.A,
+                "state": p.state, "last_close": p.last_close,
+                "market_value": p.qty * p.last_close, "entry_date": p.entry_date,
             } for p in self.positions.values()])
         else:
             positions_df = pd.DataFrame()
@@ -422,11 +395,10 @@ class Executor:
 # 对外入口
 # --------------------------------------------------------------------------- #
 def run_executor(feature_df, cfg, use_macd=True, use_exits=True, use_adds=True,
-                 use_reduces=True, position_mode=None, frozen_kelly_returns=None,
-                 bench_df=None, seed=42):
+                 use_reduces=True, bench_df=None, seed=42, **_kwargs):
+    """回测入口。**_kwargs 吸收历史遗留参数(position_mode/frozen_kelly_returns 等)。"""
     ex = Executor(feature_df, cfg, use_macd=use_macd, use_exits=use_exits,
-                  use_adds=use_adds, use_reduces=use_reduces,
-                  position_mode=position_mode, frozen_kelly_returns=frozen_kelly_returns, seed=seed)
+                  use_adds=use_adds, use_reduces=use_reduces, seed=seed)
     res = ex.run()
     if bench_df is not None and not res["equity_df"].empty:
         res["equity_df"] = _merge_benchmark(res["equity_df"], bench_df, cfg.execution.init_cash)
@@ -459,7 +431,6 @@ def run_equal_weight_trend(feature_df, cfg, bench_df=None, seed=42):
 
     for dt in dates:
         today = date_groups[dt]
-        # 执行再平衡(T-1 信号 -> T 开盘)
         if pending is not None:
             for sym in list(holdings.keys()):
                 if sym in today.index and _is_tradable(today.loc[sym]):

@@ -1,88 +1,100 @@
-"""仓位规则与原因标签(纯函数,操作 Position 状态)。
+"""交易状态机(以首笔成交价 A 为锚点,收盘价触发,T+1 开盘成交)。
 
-原因标签(MVP 保持精简,便于复盘):
-- TREND_OK / MACD_CONVERGING : 入场理由
-- ADD_ON_BREAKOUT / ADD_ON_PROFIT : 加仓理由
-- EXIT_ON_DRAWDOWN / EXIT_ON_STOP / EXIT_ON_TIME / EXIT_ON_INEFFECTIVE : 退出理由
+状态含义
+--------
+S1(仅首仓 5%):
+  - close < (1 - stop_s1_pct) * A            -> 全清止损        (EXIT_STOP)
+  - 建仓后 timeout_days 交易日内未曾 close ≥ (1+add_trigger_pct)*A -> 全清超时 (EXIT_TIME)
+  - close ≥ (1 + add_trigger_pct) * A        -> 加 5%           (ADD_STEP,状态推进到 S2)
 
-Position(由 executor 定义,duck-typed)需要属性:
-  cost, highest_close, highest_high_since_entry, entry_date,
-  atr_at_entry, add1_done, add2_done, reduce1_done, reduce2_done
+S2(首仓 + 一档加仓,合计 10%):
+  - close < (1 + stop_s2_pct) * A            -> 全清止损        (EXIT_STOP)
+  - 加仓后 timeout_days 交易日内未曾 close ≥ (1+tp1_pct)*A -> 全清超时 (EXIT_TIME)
+  - 尚未 reached_120 且 close ≤ (1 + lock_inband_pct)*A -> 全清保本 (EXIT_LOCK_INBAND)
+  - close ≥ (1 + tp1_pct) * A                -> 减 1/3           (REDUCE_TIER,-> S3)
+
+S3(6.67% 剩余):
+  - 尚未 reached_130 且 close ≤ (1 + trail_s3_pct)*A -> 剩余全清 (EXIT_TRAIL_STAGE)
+  - close ≥ (1 + tp2_pct) * A                -> 再减 1/3         (REDUCE_TIER,-> S4)
+
+S4(3.33% 剩余):
+  - 尚未 reached_140 且 close ≤ (1 + trail_s4_pct)*A -> 剩余全清 (EXIT_TRAIL_STAGE)
+  - close ≥ (1 + tp3_pct) * A                -> 全清             (EXIT_FINAL)
+
+要求 Position(duck-typed)提供:
+  A, state, entry_seq_idx, add_seq_idx,
+  reached_120, reached_130, reached_140,
+  qty (>0)
 """
 from __future__ import annotations
 
-REASON_TREND_OK = "TREND_OK"
-REASON_MACD_CONVERGING = "MACD_CONVERGING"
-REASON_ADD_ON_BREAKOUT = "ADD_ON_BREAKOUT"
-REASON_ADD_ON_PROFIT = "ADD_ON_PROFIT"
-REASON_EXIT_ON_DRAWDOWN = "EXIT_ON_DRAWDOWN"
-REASON_EXIT_ON_STOP = "EXIT_ON_STOP"
-REASON_EXIT_ON_TIME = "EXIT_ON_TIME"
-REASON_EXIT_ON_INEFFECTIVE = "EXIT_ON_INEFFECTIVE"
+from typing import Optional, Tuple
+
+# ---- 原因标签(供 fills.reason / trades 分析) ---------------------------- #
+REASON_ENTRY_PULLBACK_PREDICT = "ENTRY_PULLBACK_PREDICT"
+REASON_ADD_STEP = "ADD_STEP"
+REASON_REDUCE_TIER = "REDUCE_TIER"
+REASON_EXIT_STOP = "EXIT_STOP"
+REASON_EXIT_TIME = "EXIT_TIME"
+REASON_EXIT_LOCK_INBAND = "EXIT_LOCK_INBAND"
+REASON_EXIT_TRAIL_STAGE = "EXIT_TRAIL_STAGE"
+REASON_EXIT_FINAL = "EXIT_FINAL"
+
+Action = Tuple[str, str, float]   # (reason, kind, fraction)  kind ∈ {exit_full, reduce_step, add_step}
 
 
-def unrealized_return(pos, close: float) -> float:
-    return close / pos.cost - 1.0 if pos.cost > 0 else 0.0
+def check_state_action(pos, close: float, seq_idx: int, cfg_risk) -> Optional[Action]:
+    """按状态机判定当日该股需要挂的下一张单;返回 None 表示无动作。
 
-
-def check_add1(pos, close: float, cfg):
-    """首次加仓:突破调整高点(默认)或浮盈达 add1_profit_pct。返回 reason 或 None。"""
-    if pos.add1_done:
-        return None
-    if cfg.add1_mode == "profit":
-        if unrealized_return(pos, close) >= cfg.add1_profit_pct:
-            return REASON_ADD_ON_PROFIT
-    else:
-        if pos.highest_high_since_entry and close > pos.highest_high_since_entry:
-            return REASON_ADD_ON_BREAKOUT
-    return None
-
-
-def check_add2(pos, close: float, cfg):
-    """第二次加仓:浮盈 >= add2_profit_atr 倍 ATR(以建仓时 ATR 计)。"""
-    if pos.add2_done:
-        return None
-    if pos.atr_at_entry <= 0:
-        return None
-    profit_atr = (close - pos.cost) / pos.atr_at_entry
-    if profit_atr >= cfg.add2_profit_atr:
-        return REASON_ADD_ON_PROFIT
-    return None
-
-
-def check_full_exit(pos, close: float, today_date, cfg):
-    """清仓级退出:初始止损 / 回撤清仓 / 持仓超时 / 无效持仓。
-
-    返回 (reason, 1.0) 或 None。对应执行器 use_exits 开关(B2+ 启用)。
+    seq_idx 是当前交易日在该 symbol 时间轴上的 0-based 序号。
     """
-    # 1. 初始止损(ATR)
-    stop_price = pos.cost - cfg.init_stop_atr * pos.atr_at_entry
-    if close < stop_price:
-        return REASON_EXIT_ON_STOP, 1.0
+    A = pos.A
+    if A <= 0 or pos.qty <= 0:
+        return None
+    r = cfg_risk
+    state = pos.state
+    ratio = close / A  # close 相对锚点的比值
 
-    # 2. 回撤清仓
-    dd = 1.0 - close / pos.highest_close if pos.highest_close > 0 else 0.0
-    if dd >= cfg.drawdown_exit:
-        return REASON_EXIT_ON_DRAWDOWN, 1.0
+    # S1
+    if state == 1:
+        if ratio < 1.0 - r.stop_s1_pct:
+            return (REASON_EXIT_STOP, "exit_full", 1.0)
+        # 超时:entry_seq_idx 是建仓当日索引,T+1 ~ T+timeout_days 内
+        days_since = seq_idx - pos.entry_seq_idx
+        if days_since >= r.timeout_days and not pos.reached_110:
+            return (REASON_EXIT_TIME, "exit_full", 1.0)
+        if ratio >= 1.0 + r.add_trigger_pct:
+            return (REASON_ADD_STEP, "add_step", 0.0)
+        return None
 
-    # 3. 持仓时间
-    holding_days = (today_date - pos.entry_date).days
-    if holding_days > cfg.max_holding_days:
-        return REASON_EXIT_ON_TIME, 1.0
-    if (holding_days > cfg.ineffective_holding_days
-            and unrealized_return(pos, close) < cfg.min_effective_return):
-        return REASON_EXIT_ON_INEFFECTIVE, 1.0
-    return None
+    # S2
+    if state == 2:
+        if ratio < 1.0 + r.stop_s2_pct:
+            return (REASON_EXIT_STOP, "exit_full", 1.0)
+        days_since = seq_idx - pos.add_seq_idx if pos.add_seq_idx >= 0 else 0
+        if days_since >= r.timeout_days and not pos.reached_120:
+            return (REASON_EXIT_TIME, "exit_full", 1.0)
+        if (not pos.reached_120) and ratio <= 1.0 + r.lock_inband_pct:
+            return (REASON_EXIT_LOCK_INBAND, "exit_full", 1.0)
+        if ratio >= 1.0 + r.tp1_pct:
+            return (REASON_REDUCE_TIER, "reduce_step", r.reduce_fraction_tier)
+        return None
 
+    # S3
+    if state == 3:
+        if (not pos.reached_130) and ratio <= 1.0 + r.trail_s3_pct:
+            return (REASON_EXIT_TRAIL_STAGE, "exit_full", 1.0)
+        if ratio >= 1.0 + r.tp2_pct:
+            # 相对当前剩余仓的比例:总量本是 10%,S3 剩 6.67%,再减 3.33% => 剩余 / 剩量 = 0.5
+            return (REASON_REDUCE_TIER, "reduce_step", 0.5)
+        return None
 
-def check_reduce(pos, close: float, cfg):
-    """回撤分档减仓(部分退出)。返回 (reason, fraction) 或 None。
+    # S4
+    if state == 4:
+        if (not pos.reached_140) and ratio <= 1.0 + r.trail_s4_pct:
+            return (REASON_EXIT_TRAIL_STAGE, "exit_full", 1.0)
+        if ratio >= 1.0 + r.tp3_pct:
+            return (REASON_EXIT_FINAL, "exit_full", 1.0)
+        return None
 
-    对应执行器 use_reduces 开关(B3+ 启用)。reduce1_done/reduce2_done 防同档重复。
-    """
-    dd = 1.0 - close / pos.highest_close if pos.highest_close > 0 else 0.0
-    if dd >= cfg.drawdown_reduce_2 and not pos.reduce2_done:
-        return REASON_EXIT_ON_DRAWDOWN, cfg.reduce_fraction_2
-    if dd >= cfg.drawdown_reduce_1 and not pos.reduce1_done:
-        return REASON_EXIT_ON_DRAWDOWN, cfg.reduce_fraction_1
     return None

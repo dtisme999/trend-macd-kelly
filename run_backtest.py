@@ -1,4 +1,4 @@
-"""端到端 CLI:抓取 -> 特征 -> 对照组 B0-B4 -> 指标 -> B4 滚动验证 -> 统计检验 -> 存 DuckDB/Parquet -> 打印汇总。
+"""端到端 CLI:抓取 -> 特征 -> 对照组 B0-B4 -> 指标 -> B4 滚动验证 -> 统计检验 -> 存 Parquet -> 打印汇总。
 
 用法:
     python run_backtest.py                         # 中性档,默认股票池
@@ -18,8 +18,8 @@ from backtest.metrics import compute_metrics, format_metrics
 from backtest.vector_research import compute_daily_features
 from backtest.validation import run_validation
 from config_loader import load_config
-from data.cache import CACHE_DIR
 from data.fetch import load_data
+from data.cache import CACHE_DIR
 from storage.repo import get_conn, save_run
 
 
@@ -47,7 +47,7 @@ def _dump(res, tag):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="趋势-MACD-凯利 个人研究版 端到端回测")
+    ap = argparse.ArgumentParser(description="MACD 预判买点 + A 锚点状态机 端到端回测")
     ap.add_argument("--profile", default="neutral", choices=["conservative", "neutral", "aggressive"])
     ap.add_argument("--universe-size", type=int, default=None)
     ap.add_argument("--start", default=None)
@@ -65,7 +65,7 @@ def main():
     if args.end:
         cfg.project.end_date = args.end
 
-    print(f"== 趋势-MACD-凯利 个人研究版 | profile={args.profile} | universe={cfg.data.universe_size} ==")
+    print(f"== MACD 预判买点 状态机策略 | profile={args.profile} | universe={cfg.data.universe_size} ==")
     bars, bench, cal, basic, source = load_data(
         cfg, force_refresh=args.force_refresh, allow_synthetic=not args.no_synthetic)
     print(f"数据来源: {source} | 股票 {bars['symbol'].nunique()} 只 | {len(bars)} 条 | "
@@ -81,7 +81,7 @@ def main():
         res = run_executor(feature_df, cfg, bench_df=bench)
         m = compute_metrics(res["equity_df"], res["trades_df"], res["fills_df"], init_cash)
         print(format_metrics(m, "B4 (skip-validation)"))
-        _save_run(cfg, "B4", args.profile, source, res, m)
+        _save_run(cfg, "B4_state_machine", args.profile, source, res, m)
         _dump(res, "B4")
         return
 
@@ -92,7 +92,7 @@ def main():
     for k in ["B0", "B1", "B2", "B3", "B4"]:
         print(format_metrics(val["group_metrics"][k], k))
         print()
-    _save_run(cfg, "trend_macd_kelly_B4", args.profile, source,
+    _save_run(cfg, "MACD_state_machine_B4", args.profile, source,
               val["groups"]["B4"], val["group_metrics"]["B4"])
 
     print("========== 统计检验 ==========")
@@ -106,11 +106,11 @@ def main():
     for name, (lo, hi, pt) in val["bootstrap_ci"].items():
         print(f"    {name:14s}: {pt:.4f}  [{lo:.4f}, {hi:.4f}]")
 
-    print("\n========== 滚动扩窗 B4(冻结凯利) ==========")
+    print("\n========== 滚动扩窗 B4 ==========")
     wf = val["walk_forward"]
     print(f"  窗口数: {wf['n_windows']}")
     for w in wf["windows"]:
-        print(f"    {w['test_start']} ~ {w['test_end']}   训练闭合 {w['n_train_closed']}   验证交易 {w['n_test_trades']}")
+        print(f"    {w['test_start']} ~ {w['test_end']}   训练闭合 {w['train_closed']}   验证交易 {w['test_trades']}")
     if not wf["equity_df"].empty:
         wf_m = compute_metrics(wf["equity_df"], None, None, init_cash)
         print(format_metrics(wf_m, "Walk-forward B4"))
@@ -121,7 +121,7 @@ def main():
         if not eq.empty:
             eq.to_parquet(CACHE_DIR / f"equity_{k}.parquet", index=False)
             _dump(val["groups"][k], k)
-    print(f"\n净值/交易/成交已导出 -> {CACHE_DIR}/equity_*.parquet  (DuckDB: {CACHE_DIR}/quant.duckdb)")
+    print(f"\n净值/交易/成交已导出 -> {CACHE_DIR}/equity_*.parquet")
     print("完成。")
 
 

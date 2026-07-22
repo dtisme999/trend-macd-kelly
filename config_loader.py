@@ -2,8 +2,8 @@
 
 口径说明(报告强调"从第一天就固定口径"):
 - MACD 柱值 hist = 2 * (DIF - DEA)
-- ATR 采用 Wilder 平滑(RMA,等价 TA-Lib)
-- 复权口径统一为 hfq,所有指标/回测/凯利样本只用这一套
+- ATR 采用 Wilder 平滑(RMA,等价 TA-Lib)  ← 保留用于 vol20 相关的复盘展示
+- 复权口径统一为 hfq
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ CONFIG_DIR = Path(__file__).resolve().parent / "config"
 
 
 class ProjectConfig(BaseModel):
-    name: str = "trend_macd_kelly_personal"
+    name: str = "trend_macd_state_machine"
     market: str = "cn_stock_daily"
     benchmark: str = "000300"
     start_date: str = "2016-01-01"
@@ -25,14 +25,14 @@ class ProjectConfig(BaseModel):
 
 
 class DataConfig(BaseModel):
-    provider: str = "akshare"            # akshare | tushare
-    adjust: str = "hfq"                  # hfq | qfq | raw
+    provider: str = "akshare"
+    adjust: str = "hfq"
     use_st_filter: bool = False
     min_listing_days: int = 120
     min_avg_amount_20d: float = 50_000_000
-    symbols_source: str = "hs300"        # hs300 | custom
+    symbols_source: str = "hs300"
     custom_symbols: list[str] = Field(default_factory=list)
-    universe_size: int = 50              # 0 = 全部成分股
+    universe_size: int = 50
 
 
 class FeaturesConfig(BaseModel):
@@ -48,10 +48,11 @@ class FeaturesConfig(BaseModel):
 
 
 class SignalConfig(BaseModel):
-    wait_bars_after_death_cross: int = 2
-    convergence_bars: int = 2
-    require_hist_below_zero: bool = True
-    require_dif_turn_up: bool = False
+    """MACD 预判买点参数(hist 仍<0 但连续收敛中提前买入)。"""
+    prior_pos_bars: int = 3        # 中断前 hist>0 段最短长度(1~10)
+    min_neg_bars: int = 1          # 回调段 hist<0 至少几根后允许买入
+    max_neg_bars: int = 8          # 回调段最长根数(超过视为深回调)
+    converge_bars: int = 2         # 当日与前 N-1 根 |hist| 严格递减
     cooldown_days: int = 5
 
 
@@ -67,34 +68,26 @@ class ExecutionConfig(BaseModel):
 
 
 class PositionConfig(BaseModel):
-    mode: str = "fractional_kelly"       # fixed | fractional_kelly
+    """极简仓位:首仓与每档加仓都是 fixed_weight。"""
     fixed_weight: float = 0.05
-    kelly_fraction: float = 0.25
-    kelly_min_samples: int = 20
-    kelly_weight_min: float = 0.02
-    kelly_weight_max: float = 0.10
-    fallback_fixed_weight: float = 0.05
-    init_ratio: float = 0.40
-    add1_target_ratio: float = 0.70
-    add2_target_ratio: float = 1.00
-    add1_mode: str = "breakout"          # breakout | profit
-    add1_profit_pct: float = 0.03
-    add2_profit_atr: float = 1.0
-    vol_target: float = 0.02             # vol_adj 的 sigma*
-    max_single_weight: float = 0.10
+    max_single_weight: float = 0.10       # 首仓 5% + 一档加仓 5%
     max_total_exposure: float = 0.80
 
 
 class RiskConfig(BaseModel):
-    init_stop_atr: float = 2.0
-    drawdown_reduce_1: float = 0.05
-    drawdown_reduce_2: float = 0.08
-    drawdown_exit: float = 0.12
-    reduce_fraction_1: float = 0.33
-    reduce_fraction_2: float = 0.50
-    max_holding_days: int = 120
-    ineffective_holding_days: int = 60
-    min_effective_return: float = 0.03
+    """A 锚点状态机阈值(全部为相对首笔成交价 A 的百分比偏移)。"""
+    stop_s1_pct: float = 0.06             # close < 0.94A
+    stop_s2_pct: float = 0.03             # close < 1.03A(相对 A 的 +3%)
+    add_trigger_pct: float = 0.10         # close ≥ 1.10A → 加仓
+    tp1_pct: float = 0.20                 # 1.20A
+    tp2_pct: float = 0.30                 # 1.30A
+    tp3_pct: float = 0.40                 # 1.40A
+    lock_inband_pct: float = 0.01         # S2 未破 1.2A 且回落 1.01A → 保本
+    trail_s3_pct: float = 0.08            # S3 未破 1.3A 且回落 1.08A
+    trail_s4_pct: float = 0.15            # S4 未破 1.4A 且回落 1.15A
+    reduce_fraction_tier: float = 0.3333  # 减仓 1/3(相对总仓 10% => 3.33%)
+    timeout_days: int = 5                 # S1/S2 超时
+    max_holding_days: int = 120           # 兜底
 
 
 class ValidationConfig(BaseModel):
@@ -107,7 +100,7 @@ class ValidationConfig(BaseModel):
     bootstrap_type: str = "stationary"
     run_spa_test: bool = True
     run_dsr: bool = True
-    n_trials_for_dsr: int = 27
+    n_trials_for_dsr: int = 9
 
 
 class AppConfig(BaseModel):
@@ -152,7 +145,5 @@ if __name__ == "__main__":
     for p in ("conservative", "neutral", "aggressive"):
         cfg = load_config(profile=p)
         print(f"[{p}] trend_min={cfg.features.trend_score_min} "
-              f"wait={cfg.signal.wait_bars_after_death_cross} "
-              f"init_ratio={cfg.position.init_ratio} "
-              f"stop_atr={cfg.risk.init_stop_atr} "
-              f"max_exp={cfg.position.max_total_exposure}")
+              f"prior_pos={cfg.signal.prior_pos_bars} converge={cfg.signal.converge_bars} "
+              f"stop_s1={cfg.risk.stop_s1_pct} trail_s3={cfg.risk.trail_s3_pct}")
