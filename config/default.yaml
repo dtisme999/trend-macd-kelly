@@ -30,18 +30,22 @@ features:
   atr_period: 14
   vol_period: 20
   trend_score_min: 4
+  regime_fast: 20
+  regime_slow: 60
+  regime_slope: 20
 
 signal:
-  prior_pos_bars: 3      # 回调前 hist>0 段最短长度
-  min_neg_bars: 1        # 回调段最少几根后允许买入
-  max_neg_bars: 8        # 回调段最长根数
-  converge_bars: 2       # |hist| 严格递减根数
+  prior_pos_bars: 7          # 紧邻的前一连续正柱段不少于 7 根
+  min_neg_bars: 2            # 当前连续负柱段不少于 2 根
+  max_neg_bars: 7            # 当前连续负柱段不多于 7 根
+  convergence_count: 1       # 当前必须是连续收敛序列的第 1 根
+  min_strength_ratio: 2.0    # 前正柱最大值 / 当前负柱段最小值绝对值
   cooldown_days: 5
 
 execution:
   init_cash: 1000000
   price_rule: "next_open"
-  lot_size: 100
+  lot_size: 1                 # 策略模拟按整数股，不引入整手/零股细节
   slippage_bp: 5
   buy_commission_bp: 2.5
   sell_commission_bp: 2.5

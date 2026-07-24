@@ -1,6 +1,19 @@
-# 趋势-MACD收敛-动态凯利仓位 · 个人研究版
+# 精确 MACD 收敛筛选 + 三情景 + A 锚点状态机
 
-A 股日线研究框架,验证四件事:**趋势筛选是否给信号提纯、MACD 收敛是否改善入场时机、分批加仓是否改善收益回撤比、简化凯利是否优于固定仓位**。
+A 股日线研究框架，严格执行 MACD 柱段筛选、市场/个股三类趋势对比，以及首仓 5%、
+加仓至 10% 的 A 锚点加减仓策略。
+
+## 精确策略口径
+
+- 当前 MACD 柱值为负，连续负柱 2–7 根。
+- 当前是连续收敛的第 1 根，即 `abs(hist[t]) < abs(hist[t-1])`，但前一日不是收敛。
+- 紧邻负柱段之前的连续正柱不少于 7 根。
+- 前正柱最大值 / 当前负柱段截至当日最小值绝对值不低于 2。
+- 市场和个股都标记为 `up`、`down`、`sideways`，CLI 和 Parquet 输出分组表现。
+- `A` 为首仓实际成交价；`1.10A/1.20A/1.30A/1.40A` 分别表示上涨
+  10%/20%/30%/40%。收盘触发，下一交易日开盘成交。
+- 模拟阶段按整数股成交，不引入整手与零股申报限制；手续费、滑点和 T+1
+  成交仍保留。
 
 四层架构(报告推荐):
 - **日线数据层** `data/` — AKShare 抓取 HS300 成分股 hfq 日线 + 指数基准 + 交易日历,Parquet 缓存
@@ -35,14 +48,18 @@ python run_backtest.py --profile aggressive
 streamlit run app/streamlit_app.py
 ```
 
-输出:`data/cache/equity_B*.parquet`(净值)、`trades_*.parquet`、`fills_*.parquet`、`quant.duckdb`(回测版本/交易/成交可复现)。
+输出：`equity_B*.parquet`、`trades_*.parquet`、`fills_*.parquet`、
+`market_regime_*.parquet`、`stock_trend_*.parquet` 和 `quant.duckdb`。
 
 ## 防校验(硬性,落实为单元测试)
 
-`tests/test_anti_bias.py`:
+测试覆盖：
+
 1. 指标/信号在 symbol 内 `shift` 界定,扰动未来 K 线不改变任何历史行
 2. 所有订单由 T 日信号 → T+1 日开盘价产生(init 成交必有 T-1 信号)
-3. 凯利 p̂/b̂ 仅来自已闭合交易,样本不足退回固定仓位
+3. MACD 五项筛选的全部边界及强弱比
+4. 市场/个股三分类和分组表现可重算
+5. S1–S4 每个阈值、5 日边界、固定基数减仓和完整成交路径
 
 ```bash
 python -m pytest tests/ -v
@@ -55,11 +72,11 @@ quant/
   config/{default.yaml, profiles.yaml}   # 中性默认 + 保守/中性/激进三档
   config_loader.py                        # pydantic v2 配置 + profile 深合并
   data/{fetch.py, normalize.py, cache.py} # AKShare/Tushare + 归一化 + Parquet/合成兜底
-  strategy/{indicators,trend,macd_convergence,kelly,rules}.py
-  backtest/{vector_research,executor,metrics,validation}.py
+  strategy/{indicators,trend,macd_convergence,rules}.py
+  backtest/{vector_research,executor,regime,metrics,validation}.py
   app/{streamlit_app.py, plots.py}        # Streamlit + Plotly
   storage/{schema.sql, repo.py}           # DuckDB
-  tests/test_anti_bias.py
+  tests/{test_anti_bias,test_macd_screening,test_position_state_machine,test_regime}.py
   run_backtest.py                          # 端到端 CLI
 ```
 
@@ -67,8 +84,8 @@ quant/
 
 - MACD:`DIF=EMA12-EMA26`,`DEA=EMA9(DIF)`,`hist=2*(DIF-DEA)`
 - ATR:Wilder 平滑(RMA,等价 TA-Lib)
-- 复权:统一 `hfq`,所有指标/回测/凯利样本只用这一套
-- 成交:T 日收盘信号 → T+1 日开盘价,佣金双边 2.5bp + 最低 5 元 + 卖方印花税 10bp,100 股取整
+- 复权:统一 `hfq`,所有指标/回测只用这一套
+- 成交:T 日收盘信号 → T+1 日开盘价,佣金双边 2.5bp + 最低 5 元 + 卖方印花税 10bp；模拟按整数股
 
 ## 对照组与统计检验
 
@@ -76,21 +93,20 @@ quant/
 |---|---|---|
 | B0 | 基准持有 | 是否跑赢市场 |
 | B1 | 趋势筛选等权持有 | 选股层 |
-| B2 | +MACD收敛(固定仓位,无加减仓) | 买点层 |
-| B3 | +加仓减仓 | 仓位路径 |
-| B4 | +动态凯利 | 凯利层 |
+| B2 | 精确 MACD 入场后持有 | 买点层 |
+| B3 | 精确 MACD 入场 + 加仓后持有 | 加仓层 |
+| B4 | 完整 S1–S4 状态机 | 加减仓与退出层 |
 
-- 配对 t 检验(scipy `ttest_rel`):B4 vs 基准、B3 vs B2、B4 vs B3 的月度超额差
+- 配对 t 检验(scipy `ttest_rel`):B4 vs 基准的月度收益差
 - DSR(Bailey-López de Prado):纠正多试验选择偏差
 - SPA(arch,缺失则跳过):superior predictive ability
 - stationary bootstrap(1000 reps):年化/回撤/夏普 95% 置信区间
-- 滚动扩窗:训练 3 年 / 验证 1 年 / 步长 1 年,训练窗估凯利、验证窗冻结
+- 滚动扩窗:训练 3 年 / 验证 1 年 / 步长 1 年
 
 ## 已知简化(研究阶段取舍)
 
 - **幸存者偏差**:股票池为 HS300 当前成分快照,未按历史时点调整
 - **ST 过滤**:AKShare 无历史 ST,默认关闭;用 Tushare 可开 `data.use_st_filter`(历史 ST 自 2016 起)
-- **凯利在线估计**:B4 全周期用在线凯利(随交易更新);滚动验证窗用冻结凯利
 - vectorbt 未默认安装(规避 numba/Python 3.13 兼容风险),参数网格用纯 pandas 实现
 
 ## 不在本次范围(P2)

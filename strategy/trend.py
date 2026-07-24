@@ -13,11 +13,21 @@ from __future__ import annotations
 
 import pandas as pd
 
+from backtest.regime import classify_trend
+
 
 def compute_trend_score(df: pd.DataFrame, bench_df: pd.DataFrame, cfg) -> pd.DataFrame:
-    bc = bench_df[["trade_date", "close"]].rename(columns={"close": "bench_close"})
+    bench = bench_df[["trade_date", "close"]].copy().sort_values("trade_date")
+    bench["market_regime"] = classify_trend(
+        bench["close"],
+        fast_window=cfg.regime_fast,
+        slow_window=cfg.regime_slow,
+        slope_window=cfg.regime_slope,
+    )
+    bc = bench.rename(columns={"close": "bench_close"})
     df = df.merge(bc, on="trade_date", how="left")
     df["bench_close"] = df.groupby("symbol")["bench_close"].ffill()
+    df["market_regime"] = df.groupby("symbol")["market_regime"].ffill().fillna("sideways")
     df["rs"] = df["close"] / df["bench_close"]
     df["rs_ma60"] = df.groupby("symbol", group_keys=False)["rs"].transform(
         lambda s: s.rolling(60).mean()
@@ -33,4 +43,12 @@ def compute_trend_score(df: pd.DataFrame, bench_df: pd.DataFrame, cfg) -> pd.Dat
 
     df["trend_score"] = c1 + c2 + c3 + c4 + c5 + c6
     df["trend_ok"] = df["trend_score"] >= cfg.trend_score_min
+    df["stock_trend"] = g["close"].transform(
+        lambda s: classify_trend(
+            s,
+            fast_window=cfg.regime_fast,
+            slow_window=cfg.regime_slow,
+            slope_window=cfg.regime_slope,
+        )
+    )
     return df

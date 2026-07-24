@@ -4,16 +4,6 @@ profiles:
   conservative:
     features:
       trend_score_min: 5
-    signal:
-      prior_pos_bars: 5
-      converge_bars: 3
-      max_neg_bars: 6
-    risk:
-      stop_s1_pct: 0.05
-      stop_s2_pct: 0.025
-      trail_s3_pct: 0.07
-      trail_s4_pct: 0.13
-      timeout_days: 5
 
   neutral: {}
 
@@ -23,18 +13,3 @@ profiles:
       ma_fast: 10
       ma_mid: 40
       ma_slow: 100
-      macd_fast: 8
-      macd_slow: 21
-      macd_signal: 6
-    signal:
-      prior_pos_bars: 2
-      converge_bars: 1
-      max_neg_bars: 10
-    position:
-      max_single_weight: 0.12
-    risk:
-      stop_s1_pct: 0.07
-      stop_s2_pct: 0.035
-      trail_s3_pct: 0.10
-      trail_s4_pct: 0.17
-      timeout_days: 5

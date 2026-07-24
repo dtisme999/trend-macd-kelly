@@ -44,6 +44,43 @@ def _dump(res, tag):
     fl = res.get("fills_df")
     if fl is not None and not fl.empty:
         fl.to_parquet(CACHE_DIR / f"fills_{tag}.parquet", index=False)
+    mr = res.get("market_regime_df")
+    if mr is not None and not mr.empty:
+        mr.to_parquet(CACHE_DIR / f"market_regime_{tag}.parquet", index=False)
+    st = res.get("stock_trend_df")
+    if st is not None and not st.empty:
+        st.to_parquet(CACHE_DIR / f"stock_trend_{tag}.parquet", index=False)
+
+
+def _print_regime_comparison(res):
+    market = res.get("market_regime_df", pd.DataFrame())
+    stock = res.get("stock_trend_df", pd.DataFrame())
+    print("\n========== 市场情景下的策略表现 ==========")
+    if market.empty:
+        print("  无可用市场情景数据")
+    else:
+        print(market.to_string(
+            index=False,
+            formatters={
+                "cumulative_return": lambda x: f"{x:.2%}",
+                "annualized_return": lambda x: f"{x:.2%}",
+                "annualized_volatility": lambda x: f"{x:.2%}",
+                "sharpe": lambda x: f"{x:.3f}",
+                "win_rate": lambda x: f"{x:.2%}",
+            },
+        ))
+    print("\n========== 个股入场趋势下的交易表现 ==========")
+    if stock.empty:
+        print("  无已闭合交易")
+    else:
+        print(stock.to_string(
+            index=False,
+            formatters={
+                "average_return": lambda x: f"{x:.2%}",
+                "win_rate": lambda x: f"{x:.2%}",
+                "realized_pnl": lambda x: f"{x:.2f}",
+            },
+        ))
 
 
 def main():
@@ -81,6 +118,7 @@ def main():
         res = run_executor(feature_df, cfg, bench_df=bench)
         m = compute_metrics(res["equity_df"], res["trades_df"], res["fills_df"], init_cash)
         print(format_metrics(m, "B4 (skip-validation)"))
+        _print_regime_comparison(res)
         _save_run(cfg, "B4_state_machine", args.profile, source, res, m)
         _dump(res, "B4")
         return
@@ -94,6 +132,7 @@ def main():
         print()
     _save_run(cfg, "MACD_state_machine_B4", args.profile, source,
               val["groups"]["B4"], val["group_metrics"]["B4"])
+    _print_regime_comparison(val["groups"]["B4"])
 
     print("========== 统计检验 ==========")
     for k, t in val["t_tests"].items():

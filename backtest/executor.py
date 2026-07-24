@@ -1,7 +1,7 @@
 """轻量事件执行层:按交易日循环,T 日收盘信号 -> T+1 日开盘成交。
 
 支持能力:
-- T+1 开盘成交、手续费、滑点、现金约束、100 股取整
+- T+1 开盘成交、手续费、滑点、现金约束、整数股模拟
 - A 锚点状态机(S1/S2/S3/S4)驱动的加仓、减仓、止损、超时、保本、回落全清
 - FIFO 分批跟踪(首仓 = "init",一档加仓 = "add1")
 
@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from backtest.regime import summarize_market_regime, summarize_stock_trend
 from strategy import rules as rules_mod
 
 
@@ -36,8 +37,11 @@ class Order:
     side: str              # buy | sell
     order_type: str        # init | add1 | reduce | exit
     target_value: float = 0.0
+    target_qty: int = 0
     reduce_fraction: float = 0.0
     reason: str = ""
+    market_regime: str = "sideways"
+    stock_trend: str = "sideways"
 
 
 @dataclass
@@ -60,6 +64,10 @@ class Position:
     realized_by_type: dict = field(default_factory=lambda: {"init": 0.0, "add1": 0.0})
     reduce_fills: list = field(default_factory=list)
     exit_price: float = 0.0
+    peak_qty: int = 0
+    initial_risk_B: float = 0.0
+    entry_market_regime: str = "sideways"
+    entry_stock_trend: str = "sideways"
 
     @property
     def qty(self) -> int:
@@ -242,13 +250,18 @@ class Executor:
                 entry_seq_idx=seq_idx,
                 highest_close=float(today.loc[od.symbol, "close"]),
                 last_close=float(today.loc[od.symbol, "close"]),
+                entry_market_regime=od.market_regime,
+                entry_stock_trend=od.stock_trend,
             )
             self.positions[od.symbol] = pos
         pos.lots.append(Lot(od.order_type, qty, fill_px, dt))
         pos.cost_total += cost
+        if od.order_type == "init":
+            pos.initial_risk_B = qty * fill_px * self.cfg.risk.stop_s1_pct
         if od.order_type == "add1":
             pos.state = 2
             pos.add_seq_idx = seq_idx
+            pos.peak_qty = pos.qty
 
         self.fills.append({
             "trade_date": dt, "symbol": od.symbol, "action": "BUY",
@@ -262,7 +275,9 @@ class Executor:
             return
         ec = self.cfg.execution
         fill_px = open_px * (1 - ec.slippage_bp / 1e4)
-        if od.reduce_fraction >= 1.0:
+        if od.target_qty > 0:
+            qty = min(pos.qty, od.target_qty)
+        elif od.reduce_fraction >= 1.0:
             qty = pos.qty
         else:
             qty = int((pos.qty * od.reduce_fraction) // ec.lot_size * ec.lot_size)
@@ -319,6 +334,9 @@ class Executor:
             "init_pnl": init_pnl, "add_pnl": add_pnl, "reduce_protection": reduce_prot,
             "reached_120": pos.reached_120, "reached_130": pos.reached_130,
             "reached_140": pos.reached_140,
+            "initial_risk_B": pos.initial_risk_B,
+            "entry_market_regime": pos.entry_market_regime,
+            "entry_stock_trend": pos.entry_stock_trend,
         })
         self.last_exit_date[pos.symbol] = exit_date
         del self.positions[pos.symbol]
@@ -340,7 +358,11 @@ class Executor:
                                       reduce_fraction=1.0, reason=reason))
             return
         if kind == "reduce_step" and self.use_reduces:
+            lot_size = self.cfg.execution.lot_size
+            base_qty = pos.peak_qty or pos.qty
+            tier_qty = int((base_qty / 3) // lot_size * lot_size)
             self.pending.append(Order(sym, "sell", "reduce",
+                                      target_qty=tier_qty,
                                       reduce_fraction=frac, reason=reason))
             return
         if kind == "add_step" and self.use_adds:
@@ -367,7 +389,11 @@ class Executor:
                 continue
             self.pending.append(Order(sym, "buy", "init",
                                       target_value=target_value,
-                                      reason=rules_mod.REASON_ENTRY_PULLBACK_PREDICT))
+                                      reason=rules_mod.REASON_ENTRY_PULLBACK_PREDICT,
+                                      market_regime=str(today.loc[sym].get(
+                                          "market_regime", "sideways")),
+                                      stock_trend=str(today.loc[sym].get(
+                                          "stock_trend", "sideways"))))
 
     # ---- 结果 ----
     def _results(self):
@@ -381,6 +407,9 @@ class Executor:
                 "symbol": p.symbol, "qty": p.qty, "cost": p.cost, "A": p.A,
                 "state": p.state, "last_close": p.last_close,
                 "market_value": p.qty * p.last_close, "entry_date": p.entry_date,
+                "peak_qty": p.peak_qty, "initial_risk_B": p.initial_risk_B,
+                "entry_market_regime": p.entry_market_regime,
+                "entry_stock_trend": p.entry_stock_trend,
             } for p in self.positions.values()])
         else:
             positions_df = pd.DataFrame()
@@ -402,6 +431,8 @@ def run_executor(feature_df, cfg, use_macd=True, use_exits=True, use_adds=True,
     res = ex.run()
     if bench_df is not None and not res["equity_df"].empty:
         res["equity_df"] = _merge_benchmark(res["equity_df"], bench_df, cfg.execution.init_cash)
+    res["market_regime_df"] = summarize_market_regime(res["equity_df"], feature_df)
+    res["stock_trend_df"] = summarize_stock_trend(res["trades_df"])
     return res
 
 
