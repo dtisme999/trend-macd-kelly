@@ -57,44 +57,44 @@ def check_state_action(pos, close: float, seq_idx: int, cfg_risk) -> Optional[Ac
 
     # S1
     if state == 1:
-        if ratio < 1.0 - r.stop_s1_pct:
+        if ratio <= 1.0 - r.stop_s1_pct:
             return (REASON_EXIT_STOP, "exit_full", 1.0)
+        # 达标动作优先于同日超时；第 5 个交易日收盘达标仍算成功。
+        if ratio >= 1.0 + r.add_trigger_pct:
+            return (REASON_ADD_STEP, "add_step", 0.0)
         # 超时:entry_seq_idx 是建仓当日索引,T+1 ~ T+timeout_days 内
         days_since = seq_idx - pos.entry_seq_idx
         if days_since >= r.timeout_days and not pos.reached_110:
             return (REASON_EXIT_TIME, "exit_full", 1.0)
-        if ratio >= 1.0 + r.add_trigger_pct:
-            return (REASON_ADD_STEP, "add_step", 0.0)
         return None
 
     # S2
     if state == 2:
-        if ratio < 1.0 + r.stop_s2_pct:
+        if ratio <= 1.0 + r.stop_s2_pct:
             return (REASON_EXIT_STOP, "exit_full", 1.0)
+        if ratio >= 1.0 + r.tp1_pct:
+            return (REASON_REDUCE_TIER, "reduce_step", r.reduce_fraction_tier)
         days_since = seq_idx - pos.add_seq_idx if pos.add_seq_idx >= 0 else 0
         if days_since >= r.timeout_days and not pos.reached_120:
             return (REASON_EXIT_TIME, "exit_full", 1.0)
         if (not pos.reached_120) and ratio <= 1.0 + r.lock_inband_pct:
             return (REASON_EXIT_LOCK_INBAND, "exit_full", 1.0)
-        if ratio >= 1.0 + r.tp1_pct:
-            return (REASON_REDUCE_TIER, "reduce_step", r.reduce_fraction_tier)
         return None
 
     # S3
     if state == 3:
+        if ratio >= 1.0 + r.tp2_pct:
+            return (REASON_REDUCE_TIER, "reduce_step", 0.5)
         if (not pos.reached_130) and ratio <= 1.0 + r.trail_s3_pct:
             return (REASON_EXIT_TRAIL_STAGE, "exit_full", 1.0)
-        if ratio >= 1.0 + r.tp2_pct:
-            # 相对当前剩余仓的比例:总量本是 10%,S3 剩 6.67%,再减 3.33% => 剩余 / 剩量 = 0.5
-            return (REASON_REDUCE_TIER, "reduce_step", 0.5)
         return None
 
     # S4
     if state == 4:
-        if (not pos.reached_140) and ratio <= 1.0 + r.trail_s4_pct:
-            return (REASON_EXIT_TRAIL_STAGE, "exit_full", 1.0)
         if ratio >= 1.0 + r.tp3_pct:
             return (REASON_EXIT_FINAL, "exit_full", 1.0)
+        if (not pos.reached_140) and ratio <= 1.0 + r.trail_s4_pct:
+            return (REASON_EXIT_TRAIL_STAGE, "exit_full", 1.0)
         return None
 
     return None

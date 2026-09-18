@@ -45,21 +45,25 @@ class FeaturesConfig(BaseModel):
     atr_period: int = 14
     vol_period: int = 20
     trend_score_min: int = 4
+    regime_fast: int = 20
+    regime_slow: int = 60
+    regime_slope: int = 20
 
 
 class SignalConfig(BaseModel):
-    """MACD 预判买点参数(hist 仍<0 但连续收敛中提前买入)。"""
-    prior_pos_bars: int = 3        # 中断前 hist>0 段最短长度(1~10)
-    min_neg_bars: int = 1          # 回调段 hist<0 至少几根后允许买入
-    max_neg_bars: int = 8          # 回调段最长根数(超过视为深回调)
-    converge_bars: int = 2         # 当日与前 N-1 根 |hist| 严格递减
+    """严格 MACD 筛选参数。"""
+    prior_pos_bars: int = 7
+    min_neg_bars: int = 2
+    max_neg_bars: int = 7
+    convergence_count: int = 1
+    min_strength_ratio: float = 2.0
     cooldown_days: int = 5
 
 
 class ExecutionConfig(BaseModel):
     init_cash: float = 1_000_000.0
     price_rule: str = "next_open"
-    lot_size: int = 100
+    lot_size: int = 1
     slippage_bp: float = 5.0
     buy_commission_bp: float = 2.5
     sell_commission_bp: float = 2.5
@@ -145,5 +149,5 @@ if __name__ == "__main__":
     for p in ("conservative", "neutral", "aggressive"):
         cfg = load_config(profile=p)
         print(f"[{p}] trend_min={cfg.features.trend_score_min} "
-              f"prior_pos={cfg.signal.prior_pos_bars} converge={cfg.signal.converge_bars} "
+              f"prior_pos={cfg.signal.prior_pos_bars} converge={cfg.signal.convergence_count} "
               f"stop_s1={cfg.risk.stop_s1_pct} trail_s3={cfg.risk.trail_s3_pct}")

@@ -27,7 +27,9 @@ def compute_daily_features(bars: pd.DataFrame, bench_df: pd.DataFrame, cfg) -> p
 SIGNAL_COLUMNS = [
     "trade_date", "symbol", "open", "high", "low", "close", "volume", "amount",
     "ma_fast", "ma_mid", "ma_slow", "dif", "dea", "hist", "atr", "vol20",
-    "trend_score", "trend_ok", "prior_pos_run", "neg_run_k", "entry_candidate",
+    "trend_score", "trend_ok", "stock_trend", "market_regime",
+    "prior_pos_run", "neg_run_k", "convergence_count", "prior_pos_max",
+    "current_neg_min", "macd_strength_ratio", "entry_candidate",
 ]
 
 
@@ -47,7 +49,7 @@ def _set_nested(cfg_obj, dotted: str, value):
 def param_grid_scan(base_cfg, param_grid: dict, run_fn, metric_fn) -> pd.DataFrame:
     """参数网格扫描。
 
-    param_grid: {"features.trend_score_min": [3,4,5], "signal.convergence_bars": [1,2], ...} (dotted keys)
+    param_grid: {"features.trend_score_min": [3,4,5], "signal.min_strength_ratio": [2,3], ...} (dotted keys)
     run_fn(cfg) -> 结果对象(传给 metric_fn)
     metric_fn(result) -> dict 指标
     返回 runs_df:每行一个参数组合 + 指标。

@@ -42,7 +42,8 @@ def _entry_friendly_cfg():
     cfg.signal.prior_pos_bars = 1
     cfg.signal.min_neg_bars = 1
     cfg.signal.max_neg_bars = 10
-    cfg.signal.converge_bars = 1
+    cfg.signal.convergence_count = 1
+    cfg.signal.min_strength_ratio = 0
     cfg.position.fixed_weight = 0.05
     return cfg
 

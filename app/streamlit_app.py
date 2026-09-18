@@ -49,53 +49,16 @@ def sidebar_params():
         ["conservative", "neutral", "aggressive"],
         index=1,
         help=(
-            "**一键切换风险偏好档位,加载 config/profiles.yaml 中的预设。**\n\n"
-            "- **conservative(保守)**:回调前 hist>0 需 5 根,收敛需连续 3 根,stop 线近,信号少胜率高。\n"
-            "- **neutral(中性)**:与 default.yaml 完全一致。**默认推荐。**\n"
-            "- **aggressive(激进)**:参数放宽,回调长度上限大,只需要连续 1 根收敛,stop 线远。\n\n"
-            "切换后下方参数会覆盖档位默认值,方便微调。"
+            "档位只影响辅助趋势指标；MACD 入场五项规则和 A 锚点状态机"
+            "在所有档位中保持一致。"
         ),
     )
     cfg = load_config(profile=profile)
 
-    st.sidebar.markdown("#### 信号参数")
-    cfg.features.trend_score_min = st.sidebar.slider(
-        "趋势分阈值", 3, 6, cfg.features.trend_score_min,
-        help=(
-            "**六维趋势打分的最小入围值**(每维 1 分,满分 6 分)。\n\n"
-            "六个维度:① 收盘 > MA20 ② MA20 > MA60 ③ MA60 > MA120 ④ MA20 斜率>0 "
-            "⑤ MA60 斜率>0 ⑥ 20 日收益 > 基准 20 日收益。\n\n"
-            "- 3:极宽松,信号最多但假突破多。\n"
-            "- 4(默认):中庸,兼顾数量与质量。\n"
-            "- 5:只在明确多头排列时才进,交易数骤减。\n"
-            "- 6:最严格。"
-        ),
-    )
-    cfg.signal.prior_pos_bars = st.sidebar.slider(
-        "回调前 hist>0 最少根数", 1, 10, cfg.signal.prior_pos_bars,
-        help=(
-            "**回调前需要至少多少根连续的 hist>0(多头动量确立)。**\n\n"
-            "- 1~2:抓所有回调,信号最多。\n"
-            "- 3(默认):需要至少 3 根绿柱,过滤短促反弹。\n"
-            "- 5~10:只抓明显多头趋势中的小回调。"
-        ),
-    )
-    cfg.signal.converge_bars = st.sidebar.slider(
-        "hist 收敛连续根数", 1, 5, cfg.signal.converge_bars,
-        help=(
-            "**hist<0 期间,|hist| 严格递减(越来越接近 0)至少需要多少根才算信号。**\n\n"
-            "- 1:任何收窄都算,信号最多。\n"
-            "- 2(默认):两连收敛,过滤一日跳空噪声。\n"
-            "- 3~5:明确的底背离结构,信号最可靠但最稀。"
-        ),
-    )
-    cfg.signal.max_neg_bars = st.sidebar.slider(
-        "回调最长天数", 3, 20, cfg.signal.max_neg_bars,
-        help=(
-            "**hist<0 连续段超过多少天后,即使收敛也不买入(视为深回调而非短暂回调)。**\n\n"
-            "- 5~8(默认):只抓小回调,买在趋势恢复前。\n"
-            "- 10~20:深回调也容忍,但可能买在下跌趋势的中期反弹。"
-        ),
+    st.sidebar.markdown("#### 固定 MACD 筛选")
+    st.sidebar.caption(
+        "负柱 2–7 根 · 首次收敛 1 根 · 前置正柱 ≥7 根 · "
+        "正柱峰值/负柱谷值绝对值 ≥2。趋势评分不参与入场。"
     )
     cfg.signal.cooldown_days = st.sidebar.slider(
         "清仓后冷却天数", 1, 10, cfg.signal.cooldown_days,
@@ -238,7 +201,9 @@ def main():
 
     b4 = st.session_state.get("b4", {})
     eq = b4.get("equity_df")
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["净值", "回撤", "交易列表", "个股复盘", "对照组"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["净值", "回撤", "交易列表", "个股复盘", "对照组", "情景对比"]
+    )
     with tab1:
         if eq is not None and not eq.empty:
             st.plotly_chart(plot_equity(eq), use_container_width=True)
@@ -262,6 +227,19 @@ def main():
         groups = st.session_state.get("groups")
         if groups:
             st.plotly_chart(plot_control_groups(groups), use_container_width=True)
+    with tab6:
+        st.markdown("#### 市场情景下的策略表现")
+        market_regime = b4.get("market_regime_df")
+        if market_regime is not None and not market_regime.empty:
+            st.dataframe(market_regime, use_container_width=True)
+        else:
+            st.info("无市场情景数据")
+        st.markdown("#### 个股入场趋势下的交易表现")
+        stock_trend = b4.get("stock_trend_df")
+        if stock_trend is not None and not stock_trend.empty:
+            st.dataframe(stock_trend, use_container_width=True)
+        else:
+            st.info("无已闭合交易")
 
 
 if __name__ == "__main__":
