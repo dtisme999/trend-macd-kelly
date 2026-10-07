@@ -171,10 +171,11 @@ def spa_test(strategy_monthly: pd.Series, bench_monthly: pd.Series, reps: int = 
         if len(df) < 30:
             return {"p": None, "note": "样本不足,SPA 跳过"}
         np.random.seed(42)  # arch 不接受 random_state,统一设种子
-        spa = SPA(df["b"].values, df["s"].values.reshape(-1, 1),
+        # SPA compares losses: negative returns make higher returns lower losses.
+        spa = SPA(-df["b"].values, -df["s"].values.reshape(-1, 1),
                   bootstrap="stationary", reps=reps)
         spa.compute()
-        p = float(np.asarray(spa.pvalues).flat[0])  # arch 8.0: pvalues(数组)
+        p = float(spa.pvalues["consistent"])
         return {"p": p, "note": "SPA (stationary bootstrap)"}
     except Exception as e:  # noqa: BLE001
         return {"p": None, "note": f"SPA 计算失败: {e}"}
